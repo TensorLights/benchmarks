@@ -21,6 +21,7 @@ from __future__ import print_function
 
 import argparse
 from collections import namedtuple
+import datetime
 import math
 import multiprocessing
 import os
@@ -394,6 +395,16 @@ flags.DEFINE_string('result_storage', None,
                     '`cbuild_benchmark_datastore` means results will be stored '
                     'in cbuild datastore (note: this option requires special '
                     'permissions and meant to be used from cbuilds).')
+# Added support for TensorLights
+flags.DEFINE_integer('target_global_step', None,
+                   'the target number of global step to exit the eval '
+                   'procedure. Only valid if eval is true.')
+flags.DEFINE_boolean('eval_calculate_accuracy', True,
+                     'whether the eval process should calculate accuracy. '
+                     'If false, only step and step timestamp are printed out'
+                     'in the eval output to measure computation performance.')
+flags.DEFINE_boolean('measure_barrier_wait', False,
+                     'whether measure and log worker waiting for barrier')
 
 
 platforms_util.define_platform_params()
@@ -601,26 +612,42 @@ def get_perf_timing_str(batch_size, step_train_times, scale=1):
     return 'images/sec: %.1f' % speed_mean
 
 
-def load_checkpoint(saver, sess, ckpt_dir):
+def load_checkpoint(saver, sess, ckpt_dir, skip_global_step_up_to):
   ckpt = tf.train.get_checkpoint_state(ckpt_dir)
-  if ckpt and ckpt.model_checkpoint_path:
-    if os.path.isabs(ckpt.model_checkpoint_path):
+  # The 'checkpoint' file is on the chief work host, which may not be
+  # the same host that runs the ps and eval. In case the 'checkpoint' file is
+  # missing, we try to find the list  of available checkpoints on eval host in
+  # another way as follows. The names of checkpoing index files written by ps
+  # have a pattern of 'model.ckpt-0.index'. So we find all files ending with
+  # *.index and drop the .index subfix to get the list of all checkpoint files.
+  if ckpt:
+    ckpt_paths = ckpt.all_model_checkpoint_paths
+  else:
+    index_files = gfile.Glob(os.path.join(ckpt_dir, '*.index'))
+    if len(index_files) > 0:
+      index_files.sort(key=os.path.getmtime, reverse=True)
+    ckpt_paths = [x.rsplit('.', 1)[0] for x in index_files]
+  if len(ckpt_paths) > 0:
+    # find out the ckpt file after 'skip_global_step_up_to'
+    for path in ckpt_paths:
+        # Assuming model_checkpoint_path looks something like:
+        #   /my-favorite-path/imagenet_train/model.ckpt-0,
+        # extract global_step from it.
+        global_step = int(path.split('/')[-1].split('-')[-1])
+        if global_step > skip_global_step_up_to:
+          break # for path
+    # the first ckpt after 'skip_global_step_up_to' or the latest ckpt.
+    ckpt_path_to_eval = path
+    if os.path.isabs(ckpt_path_to_eval):
       # Restores from checkpoint with absolute path.
-      model_checkpoint_path = ckpt.model_checkpoint_path
+      model_checkpoint_path = ckpt_path_to_eval
     else:
       # Restores from checkpoint with relative path.
-      model_checkpoint_path = os.path.join(ckpt_dir, ckpt.model_checkpoint_path)
-    # Assuming model_checkpoint_path looks something like:
-    #   /my-favorite-path/imagenet_train/model.ckpt-0,
-    # extract global_step from it.
-    global_step = ckpt.model_checkpoint_path.split('/')[-1].split('-')[-1]
-    if not global_step.isdigit():
-      global_step = 0
-    else:
-      global_step = int(global_step)
+      model_checkpoint_path = os.path.join(ckpt_dir, ckpt_path_to_eval)
     saver.restore(sess, model_checkpoint_path)
-    log_fn('Successfully loaded model from %s.' % ckpt.model_checkpoint_path)
-    return global_step
+    ckpt_tss = tf.train.get_checkpoint_mtimes([model_checkpoint_path])
+    log_fn('Successfully loaded model from %s.' % model_checkpoint_path)
+    return (global_step, ckpt_tss[0])
   else:
     raise CheckpointNotFoundException('No checkpoint file found.')
 
@@ -1167,8 +1194,10 @@ class BenchmarkCNN(object):
     """
     (image_producer_ops, enqueue_ops, fetches) = self._build_model()
     saver = tf.train.Saver(self.variable_mgr.savable_variables())
-    summary_writer = tf.summary.FileWriter(self.params.eval_dir,
-                                           tf.get_default_graph())
+    # Disable writing graph.
+    # summary_writer = tf.summary.FileWriter(self.params.eval_dir,
+    #                                        tf.get_default_graph())
+    summary_writer = tf.summary.FileWriter(self.params.eval_dir)
     target = ''
     local_var_init_op = tf.local_variables_initializer()
     variable_mgr_init_ops = [local_var_init_op]
@@ -1177,26 +1206,66 @@ class BenchmarkCNN(object):
     local_var_init_op_group = tf.group(*variable_mgr_init_ops)
     summary_op = tf.summary.merge_all()
     # TODO(huangyp): Check if checkpoints haven't updated for hours and abort.
+    skip_global_step_up_to = -1
+    time_since_last_ckpt_change_sec = 0
     while True:
-      self._eval_once(saver, summary_writer, target, local_var_init_op_group,
-                      image_producer_ops, enqueue_ops, fetches, summary_op)
+      # Update time_since_last_ckpt_change_sec when we have a new checkpoint
+      last_eval_global_step = self._eval_once(
+        saver, summary_writer, target, local_var_init_op_group,
+        image_producer_ops, enqueue_ops, fetches, summary_op,
+        skip_global_step_up_to)
+      if last_eval_global_step == skip_global_step_up_to:
+        time_since_last_ckpt_change_sec = (
+          time_since_last_ckpt_change_sec + self.params.eval_interval_secs)
+      else:
+        time_since_last_ckpt_change_sec = 0
+      # Exit eval loop when we have reached the target_global_step.
+      if self.params.target_global_step is not None\
+        and self.params.target_global_step < last_eval_global_step:
+        log_fn('Exit eval with global_step={} (> target={}).'.format(
+          last_eval_global_step, self.params.target_global_step))
+        break
       if self.params.eval_interval_secs <= 0:
         break
+      skip_global_step_up_to = last_eval_global_step
       time.sleep(self.params.eval_interval_secs)
     return {}
 
   def _eval_once(self, saver, summary_writer, target, local_var_init_op_group,
-                 image_producer_ops, enqueue_ops, fetches, summary_op):
-    """Evaluate the model from a checkpoint using validation dataset."""
+                 image_producer_ops, enqueue_ops, fetches, summary_op,
+                 skip_global_step_up_to):
+    """Evaluate the model from a checkpoint using validation dataset.
+
+    Returns:
+      The global step at which the model is evaluated at.
+    """
     with tf.Session(
         target=target, config=create_config_proto(self.params)) as sess:
       if self.params.train_dir is None:
         raise ValueError('Trained model directory not specified')
       try:
-        global_step = load_checkpoint(saver, sess, self.params.train_dir)
+        (global_step, ckpt_ts) = load_checkpoint(
+          saver, sess, self.params.train_dir, skip_global_step_up_to)
       except CheckpointNotFoundException:
         log_fn('Checkpoint not found in %s' % self.params.train_dir)
-        return
+        return -1
+
+      # Return early if we have seen this checkpoint before. This means
+      # no new checkpoint has been written out since our last wake up.
+      # We have evaluated the most recent checkpoint. No need to eval again.
+      if global_step <= skip_global_step_up_to:
+        return skip_global_step_up_to
+
+      # Return early if we do not need to calculate the accuracy of the
+      # checkpoints.
+      if not self.params.eval_calculate_accuracy:
+        # Write out some log for performance analysis.
+        log_fn('[lcurve_header]; step_ts; step; top_1_accuracy; top_5_accuracy;')
+        log_fn('[lcurve_values]; {}; {}; -1; -1;'.format(
+          datetime.datetime.fromtimestamp(ckpt_ts).strftime('%Y-%m-%d %H:%M:%S'),
+          global_step))
+        return global_step
+
       sess.run(local_var_init_op_group)
       if self.dataset.queue_runner_required():
         tf.train.start_queue_runners(sess=sess)
@@ -1244,6 +1313,12 @@ class BenchmarkCNN(object):
       log_fn('-' * 64)
       log_fn('total images/sec: %.2f' % images_per_sec)
       log_fn('-' * 64)
+      # Write out some logs for performance analysis.
+      log_fn('[lcurve_header]; step_ts; step; top_1_accuracy; top_5_accuracy; num_of_examples;')
+      log_fn('[lcurve_values]; {}; {}; {:.4f}; {:.4f}; {};'.format(
+          datetime.datetime.fromtimestamp(ckpt_ts).strftime('%Y-%m-%d %H:%M:%S'),
+          global_step, accuracy_at_1, accuracy_at_5, total_eval_count))
+      return global_step
 
   def _benchmark_cnn(self):
     """Run cnn in benchmark mode. Skip the backward pass if forward_only is on.
@@ -1379,7 +1454,10 @@ class BenchmarkCNN(object):
             sess, global_step,
             self.num_workers * self.num_warmup_batches +
             self.init_global_step,
-            self.num_workers * (self.num_warmup_batches + self.num_batches) - 1)
+            # Allow more slack in stopping criteria, otherwise the global step
+            # watcher may never allow the chieft worker to exit. This may be a
+            # bug in the benchmark implementation.
+            self.num_workers * (self.num_warmup_batches + self.num_batches - 1))
         global_step_watcher.start()
       else:
         global_step_watcher = None
@@ -1399,7 +1477,7 @@ class BenchmarkCNN(object):
           self.params.variable_update == 'horovod'):
         # In cross-replica sync mode, all workers must run the same number of
         # local steps, or else the workers running the extra step will block.
-        done_fn = lambda: local_step == self.num_batches
+        done_fn = lambda: local_step >= self.num_batches
       else:
         done_fn = global_step_watcher.done
       if self.params.debugger is not None:
@@ -2003,19 +2081,43 @@ class BenchmarkCNN(object):
       queue_ops = []
       # For each other worker, add an entry in a queue, signaling that it can
       # finish this step.
-      token = tf.constant(False)
-      with tf.control_dependencies(enqueue_after_list):
-        for i, q in enumerate(sync_queues):
-          if i == self.task_index:
-            queue_ops.append(tf.no_op())
-          else:
-            queue_ops.append(q.enqueue(token))
+      if self.params.measure_barrier_wait and 'sync_queues_step_end' in name_prefix:
+        # Add support for barrier wait time measurements. It is only activated when
+        # measure_barrier_wait is True.
+        with tf.control_dependencies(enqueue_after_list):
+          # Entering the barrier
+          barrier_start = tf.timestamp()
+        token = tf.constant(False)
+        with tf.control_dependencies([barrier_start]):
+          for i, q in enumerate(sync_queues):
+            if i == self.task_index:
+              queue_ops.append(tf.no_op())
+            else:
+              queue_ops.append(q.enqueue(token))
+        # Drain tokens off queue for this worker, one for each other worker.
+        queue_ops.append(
+            sync_queues[self.task_index].dequeue_many(len(sync_queues) - 1))
+        with tf.control_dependencies(queue_ops):
+          # Exiting the barrier
+          wk_id = tf.constant(self.task_index)
+          ts = tf.timestamp()
+          queue_ops.append(tf.Print(ts, [wk_id, barrier_start, ts, ts - barrier_start],
+                           message='barrier_log %s wid/s/e/d ' % (name_prefix)))
+        return tf.group(*queue_ops)
+      else:
+        # Original implementation without barrier waiting measurement
+        token = tf.constant(False)
+        with tf.control_dependencies(enqueue_after_list):
+          for i, q in enumerate(sync_queues):
+            if i == self.task_index:
+              queue_ops.append(tf.no_op())
+            else:
+              queue_ops.append(q.enqueue(token))
+        # Drain tokens off queue for this worker, one for each other worker.
+        queue_ops.append(
+            sync_queues[self.task_index].dequeue_many(len(sync_queues) - 1))
+        return tf.group(*queue_ops)
 
-      # Drain tokens off queue for this worker, one for each other worker.
-      queue_ops.append(
-          sync_queues[self.task_index].dequeue_many(len(sync_queues) - 1))
-
-      return tf.group(*queue_ops)
 
 
 def store_benchmarks(names_to_values, params):
